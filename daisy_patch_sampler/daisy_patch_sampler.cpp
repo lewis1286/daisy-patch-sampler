@@ -34,9 +34,10 @@ volatile float  g_play_level  = 1.0f;
 volatile float  g_input_gain  = 1.0f;
 volatile float  g_wet_mix     = 1.0f;
 
-// ─── Display timing ──────────────────────────────────────────────────────────
+// ─── Display timing + page ───────────────────────────────────────────────────
 static uint32_t last_display_ms          = 0u;
 static constexpr uint32_t DISPLAY_MS     = 33u;  // ~30 fps
+static uint8_t  g_page                   = 0u;   // 0 = main, 1 = I/O ref; toggled by encoder
 
 // ─── Buffer swap ─────────────────────────────────────────────────────────────
 // Called inside the audio callback on GATE_1 rising edge.
@@ -140,10 +141,9 @@ static void DrawProgressBar(int x, int y, int w, int h, float fill)
     }
 }
 
-// ─── Display update (~30 fps, main loop) ─────────────────────────────────────
-static void UpdateDisplay()
+// ─── Page 0: main sampler view ───────────────────────────────────────────────
+static void DrawMainPage()
 {
-    // Snapshot volatile state for this frame
     const State  cur_state  = g_state;
     const size_t rec_pos    = g_rec_pos;
     const size_t play_pos   = g_play_pos;
@@ -157,13 +157,14 @@ static void UpdateDisplay()
     const bool   rec_frozen = (max_rec > 0u && rec_pos >= max_rec);
 
     auto& disp = patch.display;
-    disp.Fill(false);
 
-    // ── Title + state ────────────────────────────────────────────────────────
+    // ── Title + state + page indicator ──────────────────────────────────────
     disp.SetCursor(0, 0);
     disp.WriteString("SAMPLER", Font_7x10, true);
-    disp.SetCursor(88, 0);
+    disp.SetCursor(72, 0);
     disp.WriteString(is_rec_a ? "A->B" : "B->A", Font_7x10, true);
+    disp.SetCursor(109, 2);
+    disp.WriteString("1/2", Font_6x8, true);
     disp.DrawLine(0, 12, 127, 12, true);
 
     // ── Record progress bar ──────────────────────────────────────────────────
@@ -189,7 +190,7 @@ static void UpdateDisplay()
     disp.DrawLine(0, 39, 127, 39, true);
 
     // ── Parameter readout ────────────────────────────────────────────────────
-    // Float printf not available with newlib-nano; format manually as integers.
+    // Float printf not available with newlib-nano; format as integers.
     {
         char tmp[32];
         const float ls  = (float)max_rec / 48000.0f;
@@ -204,15 +205,57 @@ static void UpdateDisplay()
     // ── Signal flow ──────────────────────────────────────────────────────────
     disp.SetCursor(0, 54);
     disp.WriteString(is_rec_a ? "IN->A  LOOP:B" : "IN->B  LOOP:A", Font_6x8, true);
+}
+
+// ─── Page 1: I/O reference ───────────────────────────────────────────────────
+static void DrawIOPage()
+{
+    auto& disp = patch.display;
+
+    disp.SetCursor(0, 0);
+    disp.WriteString("I/O REFERENCE", Font_7x10, true);
+    disp.SetCursor(109, 2);
+    disp.WriteString("2/2", Font_6x8, true);
+    disp.DrawLine(0, 12, 127, 12, true);
+
+    disp.SetCursor(0, 14);
+    disp.WriteString("IN1  audio input", Font_6x8, true);
+    disp.SetCursor(0, 23);
+    disp.WriteString("OUT1 mixed out (L+R)", Font_6x8, true);
+    disp.SetCursor(0, 32);
+    disp.WriteString("GT1  swap buffers", Font_6x8, true);
+
+    disp.DrawLine(0, 41, 127, 41, true);
+
+    disp.SetCursor(0, 43);
+    disp.WriteString("K1=RecLen   K2=Vol", Font_6x8, true);
+    disp.SetCursor(0, 52);
+    disp.WriteString("K3=Gain     K4=Mix", Font_6x8, true);
+}
+
+// ─── Display update (~30 fps, main loop) ─────────────────────────────────────
+static void UpdateDisplay()
+{
+    auto& disp = patch.display;
+    disp.Fill(false);
+
+    if (g_page == 0u)
+        DrawMainPage();
+    else
+        DrawIOPage();
 
     disp.Update();
 }
 
 // ─── Controls update (main loop) ─────────────────────────────────────────────
 // ProcessAnalogControls/ProcessDigitalControls are called in the audio callback,
-// so knob values here are already refreshed — just read the cached result.
+// so knob values and encoder state here are already refreshed — just read them.
 static void UpdateControls()
 {
+    // Encoder press toggles between main page and I/O reference page
+    if (patch.encoder.RisingEdge())
+        g_page ^= 1u;
+
     const float k1 = patch.GetKnobValue(DaisyPatch::CTRL_1);
     const float k2 = patch.GetKnobValue(DaisyPatch::CTRL_2);
     const float k3 = patch.GetKnobValue(DaisyPatch::CTRL_3);
