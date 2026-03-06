@@ -19,12 +19,14 @@ RECORD_A / PLAY_B ──── GATE_1 rising edge ────► RECORD_B / PLA
 
 ## Hardware I/O
 
-| Signal     | Assignment                                    |
-|------------|-----------------------------------------------|
-| Audio In 1 | Source signal                                 |
-| Audio Out 1| Mixed output (stereo — same signal L + R)     |
-| GATE_1     | Buffer swap trigger (rising edge)             |
-| CTRL_1     | Max record length (0.1 s → 120 s, logarithmic)|
+| Signal       | Assignment                                    |
+|--------------|-----------------------------------------------|
+| Audio In 1   | Ch1 source signal                             |
+| Audio In 2   | Ch2 source signal                             |
+| Audio Out 1+2| Ch1 output (same signal L + R)                |
+| Audio Out 3+4| Ch2 output (same signal L + R)                |
+| GATE_1       | Buffer swap trigger (rising edge, both ch)    |
+| CTRL_1       | Max record length (0.1 s → 60 s, logarithmic) |
 | CTRL_2     | Playback volume (0.0 → 1.0, linear)           |
 | CTRL_3     | Input gain (0.0 → 2.0, unity at centre)       |
 | CTRL_4     | Dry / wet mix (0.0 = dry, 1.0 = wet)          |
@@ -35,13 +37,15 @@ RECORD_A / PLAY_B ──── GATE_1 rising edge ────► RECORD_B / PLA
 
 - **Location:** SDRAM (`DSY_SDRAM_BSS`) — 64 MB available
 - **Format:** `float`, mono, 48 kHz
-- **Size:** 120 s × 48 000 samples/s = 5 760 000 samples per buffer
-- **Memory:** 2 × 5 760 000 × 4 bytes = **~46 MB total** (~18 MB headroom)
+- **Size:** 60 s × 48 000 samples/s = 2 880 000 samples per buffer
+- **Memory:** 4 × 2 880 000 × 4 bytes = **~44 MB total** (~20 MB headroom)
 
 ```cpp
-constexpr size_t MAX_SAMPLES = 48000u * 120u;  // 5,760,000
-float DSY_SDRAM_BSS buf_a[MAX_SAMPLES];
-float DSY_SDRAM_BSS buf_b[MAX_SAMPLES];
+constexpr size_t MAX_SAMPLES = 48000u * 60u;   // 2,880,000
+float DSY_SDRAM_BSS buf_a[MAX_SAMPLES];  // ch1 ping
+float DSY_SDRAM_BSS buf_b[MAX_SAMPLES];  // ch1 pong
+float DSY_SDRAM_BSS buf_c[MAX_SAMPLES];  // ch2 ping
+float DSY_SDRAM_BSS buf_d[MAX_SAMPLES];  // ch2 pong
 ```
 
 ---
@@ -97,18 +101,18 @@ play_pos = 0                  // playback always restarts from 0
 Knob raw value `k` (0.0 – 1.0) maps to record length via:
 
 ```
-len_sec = 0.1 * (1200.0)^k        // 0.1 s at k=0, 120 s at k=1
+len_sec = 0.1 * (600.0)^k         // 0.1 s at k=0, 60 s at k=1
 ```
 
 Implemented as:
 
 ```cpp
-float len_sec = 0.1f * powf(1200.0f, k1);  // 0.1 s – 120.0 s
+float len_sec = 0.1f * powf(600.0f, k1);   // 0.1 s – 60.0 s
 g_max_rec_len = (size_t)(len_sec * 48000.0f);
 ```
 
-`powf(1200, 0) = 1` → 0.1 s × 1 = 0.1 s
-`powf(1200, 1) = 1200` → 0.1 s × 1200 = 120 s ✓
+`powf(600, 0) = 1` → 0.1 s × 1 = 0.1 s
+`powf(600, 1) = 600` → 0.1 s × 600 = 60 s ✓
 
 ---
 
