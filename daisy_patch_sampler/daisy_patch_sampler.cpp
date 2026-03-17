@@ -31,16 +31,27 @@ volatile size_t g_play_len_a = 0;   // frozen playback length of buf_a
 volatile size_t g_play_len_b = 0;   // frozen playback length of buf_b
 
 // ─── Params (written by main loop, read by audio ISR) ────────────────────────
-volatile size_t g_max_rec_len = MAX_SAMPLES;
-volatile float  g_play_level  = 1.0f;
-volatile float  g_input_gain  = 1.0f;
-volatile float  g_wet_mix     = 1.0f;
+volatile float g_play_speed = 1.0f;   // OLA playback rate: 0.25×–4.0× (pitch invariant)
+volatile float g_play_level = 1.0f;
+volatile float g_input_gain = 1.0f;
+volatile float g_wet_mix    = 1.0f;
 
 // ─── Filter bank ─────────────────────────────────────────────────────────────
-// FilterType::OFF skips the filter block entirely (zero CPU cost).
-// FilterType::COMB is a feedback comb filter:  y[n] = x[n] + α·y[n-D]
-// which reinforces frequencies at Fs/D, 2Fs/D, … simulating room resonance.
-enum class FilterType : uint8_t { OFF, COMB };
+// FilterType::OFF   — bypass (zero CPU)
+// FilterType::COMB  — 1-tap feedback comb:  y[n] = x[n] + α₁·y[n-D₁]
+// FilterType::COMB2 — 2-tap: adds a second read at D₂ = D₁ × TAP2_RATIO
+// FilterType::COMB3 — 3-tap: adds a third  read at D₃ = D₁ × TAP3_RATIO
+// All taps share one circular buffer — no extra memory beyond CombState.
+//
+// Room-shape constants (change these to reshape the simulated space):
+//   ALPHA_DECAY  — each subsequent tap's alpha = previous × this value
+//   TAP2/3_RATIO — 2nd/3rd dimension as a fraction of the longest (tap 1)
+//                  E.g. 0.75 / 0.55 ≈ a room with proportions 1 : 0.75 : 0.55
+static constexpr float ALPHA_DECAY  = 0.9f;   // α₂ = α₁×0.9, α₃ = α₁×0.81
+static constexpr float TAP2_RATIO   = 0.75f;  // 2nd dimension: 75% of 1st
+static constexpr float TAP3_RATIO   = 0.55f;  // 3rd dimension: 55% of 1st
+
+enum class FilterType : uint8_t { OFF, COMB, COMB2, COMB3 };
 
 // CombState lives in SRAM (ISR-only, never touched by main loop).
 // MAX = 9600 samples ≈ 200 ms at 48 kHz.
@@ -81,6 +92,22 @@ static constexpr float LIM_THRESHOLD = 0.8f;
 static constexpr float LIM_RELEASE   = 0.999896f;  // exp(-1 / (0.2 * 48000))
 static float           lim_env       = 0.0f;
 
+// ─── OLA (Overlap-Add) grain state (audio ISR only) ──────────────────────────
+// Pitch-invariant playback speed: two overlapping Hann-windowed grains read the
+// playback buffer at different phases. Their windows sum to exactly 1.0 at every
+// sample (COLA property), so the output amplitude is constant regardless of speed.
+//
+// GRAIN_SIZE — grain length in samples (50 ms at 48 kHz).
+//   Larger = smoother at slow speeds; smaller = less smear at fast speeds.
+static constexpr size_t GRAIN_SIZE = 2400u;   // 50 ms at 48 kHz
+
+// Hann window lookup table — initialised once in main() before audio starts.
+static float hann_table[GRAIN_SIZE];
+
+// Two grain read pointers and their window phases (both ISR-only).
+static float  grain_pos[2]   = {0.0f, 0.0f};           // fractional buffer positions
+static size_t grain_phase[2] = {0u, GRAIN_SIZE / 2u};  // window phase (staggered by 50%)
+
 static const float* xfade_old1   = nullptr;  // old ch1 playback buffer
 static const float* xfade_old2   = nullptr;  // old ch2 playback buffer
 static size_t       xfade_pos    = 0u;        // read position in old buffers
@@ -104,6 +131,43 @@ static inline void ApplyFilter(float& s1, float& s2,
             const size_t rd = (comb.write + CombState::MAX - delay) % CombState::MAX;
             const float  y1 = s1 + alpha * comb.buf1[rd];
             const float  y2 = s2 + alpha * comb.buf2[rd];
+            comb.buf1[comb.write] = y1;
+            comb.buf2[comb.write] = y2;
+            comb.write = (comb.write + 1u < CombState::MAX) ? comb.write + 1u : 0u;
+            s1 = y1;
+            s2 = y2;
+            break;
+        }
+        case FilterType::COMB2:
+        {
+            // Two taps from the same buffer at D₁ and D₂ = D₁×TAP2_RATIO.
+            // α₂ = α₁ × ALPHA_DECAY
+            const size_t d2  = (size_t)(delay * TAP2_RATIO);
+            const size_t rd1 = (comb.write + CombState::MAX - delay) % CombState::MAX;
+            const size_t rd2 = (comb.write + CombState::MAX - (d2 < 1u ? 1u : d2)) % CombState::MAX;
+            const float  a2  = alpha * ALPHA_DECAY;
+            const float  y1  = s1 + alpha * comb.buf1[rd1] + a2 * comb.buf1[rd2];
+            const float  y2  = s2 + alpha * comb.buf2[rd1] + a2 * comb.buf2[rd2];
+            comb.buf1[comb.write] = y1;
+            comb.buf2[comb.write] = y2;
+            comb.write = (comb.write + 1u < CombState::MAX) ? comb.write + 1u : 0u;
+            s1 = y1;
+            s2 = y2;
+            break;
+        }
+        case FilterType::COMB3:
+        {
+            // Three taps at D₁, D₂ = D₁×TAP2_RATIO, D₃ = D₁×TAP3_RATIO.
+            // α₂ = α₁×ALPHA_DECAY, α₃ = α₁×ALPHA_DECAY²
+            const size_t d2  = (size_t)(delay * TAP2_RATIO);
+            const size_t d3  = (size_t)(delay * TAP3_RATIO);
+            const size_t rd1 = (comb.write + CombState::MAX - delay) % CombState::MAX;
+            const size_t rd2 = (comb.write + CombState::MAX - (d2 < 1u ? 1u : d2)) % CombState::MAX;
+            const size_t rd3 = (comb.write + CombState::MAX - (d3 < 1u ? 1u : d3)) % CombState::MAX;
+            const float  a2  = alpha * ALPHA_DECAY;
+            const float  a3  = a2    * ALPHA_DECAY;
+            const float  y1  = s1 + alpha * comb.buf1[rd1] + a2 * comb.buf1[rd2] + a3 * comb.buf1[rd3];
+            const float  y2  = s2 + alpha * comb.buf2[rd1] + a2 * comb.buf2[rd2] + a3 * comb.buf2[rd3];
             comb.buf1[comb.write] = y1;
             comb.buf2[comb.write] = y2;
             comb.write = (comb.write + 1u < CombState::MAX) ? comb.write + 1u : 0u;
@@ -143,6 +207,12 @@ static inline void SwapBuffers()
     }
     g_rec_pos  = 0;
     g_play_pos = 0;
+
+    // Reset OLA grains so playback of the new buffer starts from position 0
+    grain_pos[0]   = 0.0f;
+    grain_pos[1]   = 0.0f;
+    grain_phase[0] = 0u;
+    grain_phase[1] = GRAIN_SIZE / 2u;
 }
 
 // ─── Audio Callback ──────────────────────────────────────────────────────────
@@ -157,6 +227,12 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
     if (patch.encoder.RisingEdge())            // RisingEdge() is true for a full 1ms tick;
         g_enc_pressed = true;                  // capture as a flag so main loop sees it exactly once
 
+    // Gate is processed even when stopped so no triggers are missed.
+    // SwapBuffers() resets rec_pos to 0 — important if the buffer was frozen
+    // before the unit was stopped, so recording restarts cleanly on resume.
+    if (patch.gate_input[0].Trig())
+        SwapBuffers();
+
     // When stopped: silence all outputs — buffers are preserved at their current positions
     if (!g_running)
     {
@@ -165,12 +241,9 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
         return;
     }
 
-    if (patch.gate_input[0].Trig())
-        SwapBuffers();
-
     // Snapshot volatile params once per block to avoid repeated volatile reads
     const bool   is_rec_a = (g_state == State::RECORD_A_PLAY_B);
-    const size_t max_rec  = g_max_rec_len;
+    const float  speed    = g_play_speed;
     const float  gain     = g_input_gain;
     const float  level    = g_play_level;
     const float  wet      = g_wet_mix;
@@ -192,29 +265,45 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
     prev_filter = filter_type;
 
     size_t r = g_rec_pos;
-    size_t p = g_play_pos;
 
     for (size_t i = 0; i < size; i++)
     {
         const float in1 = in[0][i] * gain;
         const float in2 = in[1][i] * gain;
 
-        // Record both channels — freeze (stop writing) when max length reached
-        if (r < max_rec)
+        // Record both channels — freeze (stop writing) at MAX_SAMPLES
+        if (r < MAX_SAMPLES)
         {
             rec_buf[r]  = in1;
             rec_buf2[r] = in2;
             r++;
         }
 
-        // Playback both channels — loop at frozen length; silence before first swap
+        // OLA playback — two Hann-windowed grains, staggered 50%, summing to 1.0.
+        // Each grain reads the buffer at its own fractional position (linear interp)
+        // and advances by `speed` per sample, so pitch is independent of speed.
         float loop1 = 0.0f, loop2 = 0.0f;
         if (play_len > 0u)
         {
-            loop1 = play_buf[p];
-            loop2 = play_buf2[p];
-            if (++p >= play_len)
-                p = 0;
+            const float flen = (float)play_len;
+            for (int g = 0; g < 2; g++)
+            {
+                const float win  = hann_table[grain_phase[g]];
+                const float fpos = grain_pos[g];
+                const size_t i0  = (size_t)fpos;
+                const size_t i1  = (i0 + 1u < play_len) ? i0 + 1u : 0u;
+                const float  fr  = fpos - (float)i0;   // fractional part
+
+                loop1 += (play_buf[i0]  + (play_buf[i1]  - play_buf[i0])  * fr) * win;
+                loop2 += (play_buf2[i0] + (play_buf2[i1] - play_buf2[i0]) * fr) * win;
+
+                // Advance grain position and wrap
+                grain_pos[g] += speed;
+                if (grain_pos[g] >= flen) grain_pos[g] -= flen;
+
+                // Advance window phase; new grain cycle starts without position reset
+                if (++grain_phase[g] >= GRAIN_SIZE) grain_phase[g] = 0u;
+            }
         }
 
         // Crossfade: blend old loop out (fade_out) and new loop in (fade_in)
@@ -248,8 +337,9 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
     }
 
     g_rec_pos  = r;
-    g_play_pos = p;
+    g_play_pos = (size_t)grain_pos[0];  // expose grain 0 position for display progress bar
 }
+
 #endif  // PROJECT_UI_ONLY
 
 // ─── Display helpers ─────────────────────────────────────────────────────────
@@ -286,15 +376,15 @@ static void DrawMainPage()
     const State  cur_state  = g_state;
     const size_t rec_pos    = g_rec_pos;
     const size_t play_pos   = g_play_pos;
-    const size_t max_rec    = g_max_rec_len;
     const size_t play_len_a = g_play_len_a;
     const size_t play_len_b = g_play_len_b;
     const float  play_level = g_play_level;
-
     const float  input_gain = g_input_gain;
+    const float  play_speed = g_play_speed;
+
     const bool   is_rec_a   = (cur_state == State::RECORD_A_PLAY_B);
     const size_t play_len   = is_rec_a ? play_len_b : play_len_a;
-    const bool   rec_frozen = (max_rec > 0u && rec_pos >= max_rec);
+    const bool   rec_frozen = (rec_pos >= MAX_SAMPLES);
     const bool   running    = g_running;
 
     auto& disp = patch.display;
@@ -312,9 +402,7 @@ static void DrawMainPage()
     disp.SetCursor(0, 16);
     disp.WriteString(rec_frozen ? "R*" : "R ", Font_6x8, true);
     {
-        const float fill = (max_rec > 0u)
-            ? (float)rec_pos / (float)max_rec
-            : 0.0f;
+        const float fill = (float)rec_pos / (float)MAX_SAMPLES;
         DrawProgressBar(14, 15, 113, 9, fill);
     }
 
@@ -333,15 +421,16 @@ static void DrawMainPage()
     // ── Parameter readout ────────────────────────────────────────────────────
     // Float printf not available with newlib-nano; format as integers.
     {
-        char tmp[32];
-        // Convert to integer tenths of a second first, then split.
-        // Avoids floating-point boundary flicker: e.g. 1.9999 and 2.0001 both
-        // round to the same integer (20 tenths) so the display digit stays stable.
-        const int ls10 = (int)roundf((float)max_rec / 48000.0f * 10.0f);
-        const int lv10 = (int)roundf(play_level  * 10.0f);
-        const int gn10 = (int)roundf(input_gain  * 10.0f);
-        snprintf(tmp, sizeof(tmp), "LN%d.%ds LV%d.%d GN%d.%d",
-                 ls10/10, ls10%10, lv10/10, lv10%10, gn10/10, gn10%10);
+        char tmp[64];
+        // Clamp before formatting so integer parts are always single-digit,
+        // guaranteeing the output fits in the buffer. Without clamps, a float
+        // anomaly in play_speed (max 4.0) or input_gain (max 2.0) could produce
+        // a multi-digit integer part and overflow the 32-byte buffer.
+        const int sp10 = (int)roundf(fminf(fmaxf(play_speed, 0.0f), 9.9f) * 10.0f);
+        const int lv10 = (int)roundf(fminf(fmaxf(play_level, 0.0f), 9.9f) * 10.0f);
+        const int gn10 = (int)roundf(fminf(fmaxf(input_gain, 0.0f), 9.9f) * 10.0f);
+        snprintf(tmp, sizeof(tmp), "SP%d.%dx LV%d.%d GN%d.%d",
+                 sp10/10, sp10%10, lv10/10, lv10%10, gn10/10, gn10%10);
         disp.SetCursor(0, 42);
         disp.WriteString(tmp, Font_6x8, true);
     }
@@ -368,10 +457,11 @@ static void DrawFilterPage()
 
     // Filter type label
     disp.SetCursor(0, 14);
-    if (ftype == FilterType::OFF)
-        disp.WriteString("TYPE: OFF", Font_6x8, true);
-    else
-        disp.WriteString("TYPE: COMB", Font_6x8, true);
+    const char* type_str = "TYPE: OFF";
+    if      (ftype == FilterType::COMB)  type_str = "TYPE: COMB (1 tap)";
+    else if (ftype == FilterType::COMB2) type_str = "TYPE: COMB2 (2 tap)";
+    else if (ftype == FilterType::COMB3) type_str = "TYPE: COMB3 (3 tap)";
+    disp.WriteString(type_str, Font_6x8, true);
 
     // Comb delay → frequency (Fs/D)
     {
@@ -418,7 +508,7 @@ static void DrawIOPage()
     disp.DrawLine(0, 41, 127, 41, true);
 
     disp.SetCursor(0, 43);
-    disp.WriteString("K1=RecLen   K2=Vol", Font_6x8, true);
+    disp.WriteString("K1=Speed    K2=Vol", Font_6x8, true);
     disp.SetCursor(0, 52);
     disp.WriteString("K3=Gain     K4=Mix", Font_6x8, true);
 }
@@ -503,8 +593,11 @@ static void UpdateControls()
     if (g_page == 1u)
     {
         // ── Filter page: K1=FilterType, K2=comb delay (log), K3=comb alpha ──
-        // K1: 0.0–0.5 = OFF, 0.5–1.0 = COMB
-        g_filter_type = (k1 >= 0.5f) ? FilterType::COMB : FilterType::OFF;
+        // K1: 0.00–0.25=OFF  0.25–0.50=COMB  0.50–0.75=COMB2  0.75–1.00=COMB3
+        if      (k1 < 0.25f) g_filter_type = FilterType::OFF;
+        else if (k1 < 0.50f) g_filter_type = FilterType::COMB;
+        else if (k1 < 0.75f) g_filter_type = FilterType::COMB2;
+        else                  g_filter_type = FilterType::COMB3;
 
         // K2: logarithmic comb delay 48–4800 samples (1 ms–100 ms at 48 kHz)
         // delay = 48 * 100^k  →  k=0: 48 samples (1 ms),  k=1: 4800 samples (100 ms)
@@ -518,10 +611,10 @@ static void UpdateControls()
     }
     else
     {
-        // ── Sampler pages (0 and 2): K1=RecLen, K2=Vol, K3=Gain ─────────────
-        // CTRL_1: logarithmic curve  0.1 s (k=0) → 60 s (k=1)
-        const float len_sec = 0.1f * powf(600.0f, k1);
-        g_max_rec_len = (size_t)(len_sec * 48000.0f);
+        // ── Sampler pages (0 and 2): K1=Speed, K2=Vol, K3=Gain ──────────────
+        // K1: exponential speed  0.25× (k=0) → 1.0× (k=0.5) → 4.0× (k=1)
+        // powf(16, k-0.5): at k=0 → 1/4, at k=0.5 → 1, at k=1 → 4
+        g_play_speed = powf(16.0f, k1 - 0.5f);
 
         g_play_level = k2;          // CTRL_2: playback level 0.0–1.0
         g_input_gain = k3 * 2.0f;  // CTRL_3: input gain 0.0–2.0 (unity at centre)
@@ -532,6 +625,14 @@ static void UpdateControls()
 int main()
 {
     patch.Init();
+
+    // Build Hann window table used by the OLA grain engine.
+    // Must be done before StartAudio so the ISR sees a valid table immediately.
+    for (size_t i = 0; i < GRAIN_SIZE; i++)
+    {
+        const float phase = 2.0f * 3.14159265f * (float)i / (float)GRAIN_SIZE;
+        hann_table[i] = 0.5f * (1.0f - cosf(phase));
+    }
 
 #ifndef PROJECT_UI_ONLY
     patch.StartAudio(AudioCallback);
