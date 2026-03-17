@@ -31,7 +31,6 @@ volatile size_t g_play_len_a = 0;   // frozen playback length of buf_a
 volatile size_t g_play_len_b = 0;   // frozen playback length of buf_b
 
 // ─── Params (written by main loop, read by audio ISR) ────────────────────────
-volatile float g_play_speed = 1.0f;   // OLA playback rate: 0.25×–4.0× (pitch invariant)
 volatile float g_play_level = 1.0f;
 volatile float g_input_gain = 1.0f;
 volatile float g_wet_mix    = 1.0f;
@@ -92,21 +91,6 @@ static constexpr float LIM_THRESHOLD = 0.8f;
 static constexpr float LIM_RELEASE   = 0.999896f;  // exp(-1 / (0.2 * 48000))
 static float           lim_env       = 0.0f;
 
-// ─── OLA (Overlap-Add) grain state (audio ISR only) ──────────────────────────
-// Pitch-invariant playback speed: two overlapping Hann-windowed grains read the
-// playback buffer at different phases. Their windows sum to exactly 1.0 at every
-// sample (COLA property), so the output amplitude is constant regardless of speed.
-//
-// GRAIN_SIZE — grain length in samples (50 ms at 48 kHz).
-//   Larger = smoother at slow speeds; smaller = less smear at fast speeds.
-static constexpr size_t GRAIN_SIZE = 2400u;   // 50 ms at 48 kHz
-
-// Hann window lookup table — initialised once in main() before audio starts.
-static float hann_table[GRAIN_SIZE];
-
-// Two grain read pointers and their window phases (both ISR-only).
-static float  grain_pos[2]   = {0.0f, 0.0f};           // fractional buffer positions
-static size_t grain_phase[2] = {0u, GRAIN_SIZE / 2u};  // window phase (staggered by 50%)
 
 static const float* xfade_old1   = nullptr;  // old ch1 playback buffer
 static const float* xfade_old2   = nullptr;  // old ch2 playback buffer
@@ -131,8 +115,9 @@ static inline void ApplyFilter(float& s1, float& s2,
             const size_t rd = (comb.write + CombState::MAX - delay) % CombState::MAX;
             const float  y1 = s1 + alpha * comb.buf1[rd];
             const float  y2 = s2 + alpha * comb.buf2[rd];
-            comb.buf1[comb.write] = y1;
-            comb.buf2[comb.write] = y2;
+            // Clamp before writing back: prevents NaN/Inf locking into the delay line
+            comb.buf1[comb.write] = y1 >  4.0f ?  4.0f : y1 < -4.0f ? -4.0f : y1;
+            comb.buf2[comb.write] = y2 >  4.0f ?  4.0f : y2 < -4.0f ? -4.0f : y2;
             comb.write = (comb.write + 1u < CombState::MAX) ? comb.write + 1u : 0u;
             s1 = y1;
             s2 = y2;
@@ -148,8 +133,8 @@ static inline void ApplyFilter(float& s1, float& s2,
             const float  a2  = alpha * ALPHA_DECAY;
             const float  y1  = s1 + alpha * comb.buf1[rd1] + a2 * comb.buf1[rd2];
             const float  y2  = s2 + alpha * comb.buf2[rd1] + a2 * comb.buf2[rd2];
-            comb.buf1[comb.write] = y1;
-            comb.buf2[comb.write] = y2;
+            comb.buf1[comb.write] = y1 >  4.0f ?  4.0f : y1 < -4.0f ? -4.0f : y1;
+            comb.buf2[comb.write] = y2 >  4.0f ?  4.0f : y2 < -4.0f ? -4.0f : y2;
             comb.write = (comb.write + 1u < CombState::MAX) ? comb.write + 1u : 0u;
             s1 = y1;
             s2 = y2;
@@ -168,8 +153,8 @@ static inline void ApplyFilter(float& s1, float& s2,
             const float  a3  = a2    * ALPHA_DECAY;
             const float  y1  = s1 + alpha * comb.buf1[rd1] + a2 * comb.buf1[rd2] + a3 * comb.buf1[rd3];
             const float  y2  = s2 + alpha * comb.buf2[rd1] + a2 * comb.buf2[rd2] + a3 * comb.buf2[rd3];
-            comb.buf1[comb.write] = y1;
-            comb.buf2[comb.write] = y2;
+            comb.buf1[comb.write] = y1 >  4.0f ?  4.0f : y1 < -4.0f ? -4.0f : y1;
+            comb.buf2[comb.write] = y2 >  4.0f ?  4.0f : y2 < -4.0f ? -4.0f : y2;
             comb.write = (comb.write + 1u < CombState::MAX) ? comb.write + 1u : 0u;
             s1 = y1;
             s2 = y2;
@@ -208,11 +193,8 @@ static inline void SwapBuffers()
     g_rec_pos  = 0;
     g_play_pos = 0;
 
-    // Reset OLA grains so playback of the new buffer starts from position 0
-    grain_pos[0]   = 0.0f;
-    grain_pos[1]   = 0.0f;
-    grain_phase[0] = 0u;
-    grain_phase[1] = GRAIN_SIZE / 2u;
+    // Playback restarts from the beginning of the newly-promoted loop buffer
+    g_play_pos = 0;
 }
 
 // ─── Audio Callback ──────────────────────────────────────────────────────────
@@ -243,7 +225,6 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
 
     // Snapshot volatile params once per block to avoid repeated volatile reads
     const bool   is_rec_a = (g_state == State::RECORD_A_PLAY_B);
-    const float  speed    = g_play_speed;
     const float  gain     = g_input_gain;
     const float  level    = g_play_level;
     const float  wet      = g_wet_mix;
@@ -265,45 +246,30 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
     prev_filter = filter_type;
 
     size_t r = g_rec_pos;
+    size_t p = g_play_pos;
 
     for (size_t i = 0; i < size; i++)
     {
         const float in1 = in[0][i] * gain;
         const float in2 = in[1][i] * gain;
 
-        // Record both channels — freeze (stop writing) at MAX_SAMPLES
+        // Record both channels — freeze (stop writing) at MAX_SAMPLES.
+        // Hard-clip before writing: prevents NaN/Inf from entering SDRAM and
+        // poisoning the buffer permanently (would require a power cycle to clear).
         if (r < MAX_SAMPLES)
         {
-            rec_buf[r]  = in1;
-            rec_buf2[r] = in2;
+            rec_buf[r]  = in1  >  2.0f ?  2.0f : in1  < -2.0f ? -2.0f : in1;
+            rec_buf2[r] = in2  >  2.0f ?  2.0f : in2  < -2.0f ? -2.0f : in2;
             r++;
         }
 
-        // OLA playback — two Hann-windowed grains, staggered 50%, summing to 1.0.
-        // Each grain reads the buffer at its own fractional position (linear interp)
-        // and advances by `speed` per sample, so pitch is independent of speed.
+        // Playback: read loop buffer and advance; wrap at end
         float loop1 = 0.0f, loop2 = 0.0f;
         if (play_len > 0u)
         {
-            const float flen = (float)play_len;
-            for (int g = 0; g < 2; g++)
-            {
-                const float win  = hann_table[grain_phase[g]];
-                const float fpos = grain_pos[g];
-                const size_t i0  = (size_t)fpos;
-                const size_t i1  = (i0 + 1u < play_len) ? i0 + 1u : 0u;
-                const float  fr  = fpos - (float)i0;   // fractional part
-
-                loop1 += (play_buf[i0]  + (play_buf[i1]  - play_buf[i0])  * fr) * win;
-                loop2 += (play_buf2[i0] + (play_buf2[i1] - play_buf2[i0]) * fr) * win;
-
-                // Advance grain position and wrap
-                grain_pos[g] += speed;
-                if (grain_pos[g] >= flen) grain_pos[g] -= flen;
-
-                // Advance window phase; new grain cycle starts without position reset
-                if (++grain_phase[g] >= GRAIN_SIZE) grain_phase[g] = 0u;
-            }
+            loop1 = play_buf[p];
+            loop2 = play_buf2[p];
+            if (++p >= play_len) p = 0u;
         }
 
         // Crossfade: blend old loop out (fade_out) and new loop in (fade_in)
@@ -337,7 +303,7 @@ static void AudioCallback(AudioHandle::InputBuffer  in,
     }
 
     g_rec_pos  = r;
-    g_play_pos = (size_t)grain_pos[0];  // expose grain 0 position for display progress bar
+    g_play_pos = p;
 }
 
 #endif  // PROJECT_UI_ONLY
@@ -380,7 +346,6 @@ static void DrawMainPage()
     const size_t play_len_b = g_play_len_b;
     const float  play_level = g_play_level;
     const float  input_gain = g_input_gain;
-    const float  play_speed = g_play_speed;
 
     const bool   is_rec_a   = (cur_state == State::RECORD_A_PLAY_B);
     const size_t play_len   = is_rec_a ? play_len_b : play_len_a;
@@ -421,16 +386,11 @@ static void DrawMainPage()
     // ── Parameter readout ────────────────────────────────────────────────────
     // Float printf not available with newlib-nano; format as integers.
     {
-        char tmp[64];
-        // Clamp before formatting so integer parts are always single-digit,
-        // guaranteeing the output fits in the buffer. Without clamps, a float
-        // anomaly in play_speed (max 4.0) or input_gain (max 2.0) could produce
-        // a multi-digit integer part and overflow the 32-byte buffer.
-        const int sp10 = (int)roundf(fminf(fmaxf(play_speed, 0.0f), 9.9f) * 10.0f);
+        char tmp[48];
         const int lv10 = (int)roundf(fminf(fmaxf(play_level, 0.0f), 9.9f) * 10.0f);
         const int gn10 = (int)roundf(fminf(fmaxf(input_gain, 0.0f), 9.9f) * 10.0f);
-        snprintf(tmp, sizeof(tmp), "SP%d.%dx LV%d.%d GN%d.%d",
-                 sp10/10, sp10%10, lv10/10, lv10%10, gn10/10, gn10%10);
+        snprintf(tmp, sizeof(tmp), "LVL %d.%d   GAIN %d.%d",
+                 lv10/10, lv10%10, gn10/10, gn10%10);
         disp.SetCursor(0, 42);
         disp.WriteString(tmp, Font_6x8, true);
     }
@@ -508,9 +468,9 @@ static void DrawIOPage()
     disp.DrawLine(0, 41, 127, 41, true);
 
     disp.SetCursor(0, 43);
-    disp.WriteString("K1=Speed    K2=Vol", Font_6x8, true);
+    disp.WriteString("K1=Vol      K2=Gain", Font_6x8, true);
     disp.SetCursor(0, 52);
-    disp.WriteString("K3=Gain     K4=Mix", Font_6x8, true);
+    disp.WriteString("K3=--       K4=Mix", Font_6x8, true);
 }
 
 // ─── Display update (~30 fps, main loop) ─────────────────────────────────────
@@ -611,13 +571,10 @@ static void UpdateControls()
     }
     else
     {
-        // ── Sampler pages (0 and 2): K1=Speed, K2=Vol, K3=Gain ──────────────
-        // K1: exponential speed  0.25× (k=0) → 1.0× (k=0.5) → 4.0× (k=1)
-        // powf(16, k-0.5): at k=0 → 1/4, at k=0.5 → 1, at k=1 → 4
-        g_play_speed = powf(16.0f, k1 - 0.5f);
-
-        g_play_level = k2;          // CTRL_2: playback level 0.0–1.0
-        g_input_gain = k3 * 2.0f;  // CTRL_3: input gain 0.0–2.0 (unity at centre)
+        // ── Sampler pages (0 and 2): K1=Vol, K2=Gain ─────────────────────────
+        g_play_level = k1;          // CTRL_1: playback level 0.0–1.0
+        g_input_gain = k2 * 2.0f;  // CTRL_2: input gain 0.0–2.0 (unity at centre)
+        // k3 unused on sampler pages
     }
 }
 
@@ -625,14 +582,6 @@ static void UpdateControls()
 int main()
 {
     patch.Init();
-
-    // Build Hann window table used by the OLA grain engine.
-    // Must be done before StartAudio so the ISR sees a valid table immediately.
-    for (size_t i = 0; i < GRAIN_SIZE; i++)
-    {
-        const float phase = 2.0f * 3.14159265f * (float)i / (float)GRAIN_SIZE;
-        hann_table[i] = 0.5f * (1.0f - cosf(phase));
-    }
 
 #ifndef PROJECT_UI_ONLY
     patch.StartAudio(AudioCallback);
