@@ -69,9 +69,10 @@ controls loop length by swapping buffers early.
 | `g_play_level` | main loop     | audio ISR          | Playback volume                      |
 | `g_input_gain` | main loop     | audio ISR          | Input gain                           |
 | `g_wet_mix`    | main loop     | audio ISR          | Dry/wet balance                      |
-| `g_filter_type`| main loop     | audio ISR          | Comb filter type (OFF/COMB/COMB2/3)  |
+| `g_filter_type`| main loop     | audio ISR          | Filter engine (OFF/COMB/COMB2/3/CONV)|
 | `g_comb_delay` | main loop     | audio ISR          | Comb filter delay in samples         |
 | `g_comb_alpha` | main loop     | audio ISR          | Comb filter feedback coefficient     |
+| `g_ir_sel`     | main loop     | audio ISR          | Selected IR slot index (CONV mode)   |
 | `g_running`    | main loop     | audio ISR          | Pause/resume toggle                  |
 | `g_enc_delta`  | audio ISR     | main loop          | Encoder rotation accumulator         |
 | `g_enc_pressed`| audio ISR     | main loop          | Encoder press flag                   |
@@ -136,30 +137,60 @@ an additional ~10 KB of SRAM.
 
 ## Filter Bank (Page 2)
 
-Feedback comb filter applied to the loop signal (after OLA, before output mix).
+Applied to the loop signal (after OLA, before output mix). Five modes on K1:
 
-| FilterType | Taps | Delays              | Alphas                              |
-|------------|------|---------------------|-------------------------------------|
-| `OFF`      | 0    | —                   | — (bypassed entirely)               |
-| `COMB`     | 1    | D₁                  | α₁                                  |
-| `COMB2`    | 2    | D₁, D₁×0.75        | α₁, α₁×0.9                         |
-| `COMB3`    | 3    | D₁, D₁×0.75, D₁×0.55| α₁, α₁×0.9, α₁×0.81              |
+| FilterType | K1 zone   | Description |
+|------------|-----------|-------------|
+| `OFF`      | 0.00–0.20 | Bypass |
+| `COMB`     | 0.20–0.40 | 1-tap feedback comb: y[n] = x[n] + α·y[n-D] |
+| `COMB2`    | 0.40–0.60 | 2 taps at D₁, D₁×0.75 |
+| `COMB3`    | 0.60–0.80 | 3 taps at D₁, D₁×0.75, D₁×0.55 |
+| `CONV`     | 0.80–1.00 | Time-domain FIR convolution against a loaded IR |
 
-All taps share a single circular buffer (`CombState`, ~75 KB SRAM).
+### Comb modes
+
+All taps share one circular buffer (`CombState`, ~75 KB SRAM).
 Room-shape constants at top of filter bank section: `ALPHA_DECAY`, `TAP2_RATIO`, `TAP3_RATIO`.
 
-**K1 on filter page:** 0.00–0.25=OFF, 0.25–0.50=COMB, 0.50–0.75=COMB2, 0.75–1.00=COMB3
-**K2:** delay 1–100 ms logarithmic (frequency = Fs/delay)
+**K2:** delay 1–100 ms logarithmic (fundamental = Fs/delay)
 **K3:** feedback α₁ = 0.0–0.95
 
-Comb state is cleared when the filter transitions from OFF to active.
+Comb state is cleared when transitioning from OFF → any comb type.
+
+### Convolution mode (`CONV`)
+
+Time-domain FIR with IR loaded from SD card. Input history buffer (`ConvState`) lives
+in DTCM (`DTCM_MEM_SECTION`) for 0-wait-state access. IR data (SDRAM) is streamed
+sequentially and fits in the M7's 16 KB D-cache after the first block.
+
+**K2:** IR slot selector (quantised across loaded IRs)
+**K3:** unused in CONV mode
+
+**IR file format:** 48 kHz, mono, 16-bit PCM WAV named `IR_00.wav`…`IR_07.wav` at
+SD card root. Loaded at startup (before `StartAudio`), normalised to peak = 1.0.
+Unmount happens after loading — SD card not accessed during audio.
+
+**CPU cost:** N=1024 (21 ms) ≈ 20% extra; N=2048 (43 ms) ≈ 41% extra.
+**Max IR length:** `MAX_IR_LEN = 2048` samples. Longer IRs are truncated at load time.
+
+**FatFS note:** `ffascii.c` in the source directory provides minimal `ff_convert` /
+`ff_wtoupper` stubs (ASCII-only). The full `ccsbcs.c` code-page table exceeds the
+FLASH budget by ~1.1 KB and must not be used.
+
+```cpp
+constexpr uint8_t MAX_IR_SLOTS = 8u;
+constexpr size_t  MAX_IR_LEN   = 1024u;  // 1024 taps ≈ 21 ms; safe with ARM_MATH_LOOPUNROLL (~26% CPU)
+float DSY_SDRAM_BSS ir_data[MAX_IR_SLOTS][MAX_IR_LEN];  // 32 KB in SDRAM
+static ConvState DTCM_MEM_SECTION conv;                  // 8 KB in DTCM
+```
 
 ### "I Am Sitting in a Room" technique
 
 Route OUT back to IN externally. Each record/playback cycle reinforces the room's
-resonant frequencies (Fs/D, 2Fs/D, …). COMB2/COMB3 model multiple room dimensions
-simultaneously. A peak limiter (instant attack, 200 ms release, threshold 0.8)
-on the loop signal prevents blow-up over iterations.
+resonant frequencies. COMB2/COMB3 model multiple room dimensions simultaneously.
+CONV uses a real measured IR for early-reflection accuracy.
+A peak limiter (instant attack, 200 ms release, threshold 0.8) on the loop signal
+prevents blow-up over iterations.
 
 ---
 
@@ -178,7 +209,7 @@ on the loop signal prevents blow-up over iterations.
 └──────────────────────────────┘
 ```
 
-### Page 2/3 — Filter
+### Page 2/3 — Filter (comb mode)
 ```
 ┌──────────────────────────────┐
 │ FILTER                  2/3 │
@@ -190,6 +221,20 @@ on the loop signal prevents blow-up over iterations.
 │ K1=Type K2=Freq K3=Gain     │
 └──────────────────────────────┘
 ```
+
+### Page 2/3 — Filter (CONV mode)
+```
+┌──────────────────────────────┐
+│ FILTER                  2/3 │
+│──────────────────────────────│
+│ TYPE: CONV IR               │
+│ IR_00     (1/3)             │
+│ LEN: 2048smp (43ms)         │
+│──────────────────────────────│
+│ K1=Type  K2=IR sel          │
+└──────────────────────────────┘
+```
+(Shows "NO IRs ON SD CARD" if no files were found at boot.)
 
 ### Page 3/3 — I/O Reference
 ```
@@ -220,6 +265,7 @@ daisy_patch_sampler/              ← repo root
 ├── DaisySP/                      ← git submodule
 └── daisy_patch_sampler/          ← source directory
     ├── daisy_patch_sampler.cpp
+    ├── ffascii.c                 ← minimal FatFS ff_convert/ff_wtoupper stubs
     └── Makefile
 ```
 
@@ -227,10 +273,109 @@ Makefile uses `../libDaisy` and `../DaisySP`.
 
 ---
 
-## Build Commands
+## Build & Flash Commands
+
+The project runs from **external QSPI flash** (`APP_TYPE = BOOT_QSPI`). Flashing
+uses the Daisy DFU bootloader over USB — `make program` (SWD/OpenOCD) does not
+work for QSPI builds.
 
 ```bash
 # From daisy_patch_sampler/daisy_patch_sampler/
-make clean && make      # full build
-make program            # flash via debugger
+
+# Build
+make clean && make           # release build
+make clean && DEBUG=1 make   # debug build (for attaching debugger)
+
+# Flash (two steps — build must finish before tapping RESET)
+# 1. Run the build above, wait for it to complete
+# 2. Tap RESET on the Daisy Seed (opens 2-second DFU window)
+# 3. Immediately run:
+make program-dfu
+
+# One-time bootloader install (only needed if bootloader not already present)
+# Hold BOOT + tap RESET to enter ST DFU mode, then:
+make program-boot
 ```
+
+## Debugging
+
+SWD probe (ST-Link) works for debugging even though DFU is used for flashing.
+The debugger **attaches** to the running app — it does not reflash.
+
+Workflow:
+1. Build with `DEBUG=1 make`, flash with `make program-dfu` (see above)
+2. Connect SWD probe
+3. Launch "Cortex Debug" in VSCode — it attaches using hardware breakpoints
+
+**Known limitation:** Breakpoints in `main()` do not work. The Daisy bootloader
+jumps to the app after a 2-second DFU window, and at that point the debugger is
+not yet attached, so breakpoints set before the app starts are missed. Breakpoints
+in functions called from the main loop (e.g. `UpdateControls`, `UpdateDisplay`,
+`AudioCallback`) work correctly once the debugger has attached to the running app.
+
+---
+
+## CONV mode — resolved (2026-03-20)
+
+CONV mode is now working. `arm_fir_f32` (block-based, DTCM state, SDRAM
+coefficients) is used with `-DARM_MATH_LOOPUNROLL` defined in the Makefile.
+FLASH usage: 120 KB / 128 KB (91.6%, ~8 KB spare).
+
+### History / why it was hard to fix
+
+The original per-sample naive FIR cost ~786K cycles (1.6× overrun). Moving to
+`arm_fir_f32` block processing appeared to fix the root cause, but the freeze
+persisted. The missing piece was **`-DARM_MATH_LOOPUNROLL`** in the Makefile.
+
+Without that flag, `arm_fir_f32` (CMSIS-DSP v1.9.0) falls through to a
+single-accumulator inner loop:
+
+```c
+while (i > 0U) { acc0 += *px++ * *pb++; i--; }
+```
+
+On the M7, `VMLA.F32` has a **5-cycle latency**. With every iteration reading
+the previous `acc0`, the loop is dependency-limited to one MAC per 5 cycles
+instead of one per cycle. Actual ISR cost without `ARM_MATH_LOOPUNROLL`:
+
+```
+1024 taps × 48 samples × ~6 cycles × 2 channels ≈ 590K cycles
+Budget: 480 MHz / 48 kHz = 480K cycles  → 123% → tail-chains → freeze
+```
+
+With `-DARM_MATH_LOOPUNROLL`, the code uses 8 accumulators and computes 8
+output samples simultaneously, hiding the latency completely:
+
+```
+1024 taps × 48 samples × ~1.25 cycles × 2 channels ≈ 123K cycles → 26%
+```
+
+### Key lesson
+`ARM_MATH_CM7` (set by libDaisy) does **not** enable loop unrolling in CMSIS-DSP
+v1.9.0. `ARM_MATH_LOOPUNROLL` must be set explicitly in the project Makefile.
+
+---
+
+## OPEN TASKS
+
+### 1. Debugger breakpoints don't work in main()
+
+See "Debugging" section above. The bootloader jumps to the app before the SWD
+probe attaches, so any breakpoint set at or before `main()` entry is missed.
+Breakpoints inside functions called from the main loop work fine.
+
+Potential fix: add an explicit `__asm("bkpt")` or a short `System::Delay()` at
+the top of `main()` to give the debugger time to attach, then remove it after.
+Alternatively, investigate whether OpenOCD can be configured to halt on QSPI app
+entry (would require an external flash loader for the target config).
+
+### 2. IR filter output gain control (CONV mode)
+
+Currently the CONV filter has no gain control — the IR is normalised to peak=1.0
+at load time and the output level is fixed. K3 is listed as "unused in CONV mode"
+on the display.
+
+Feature: map K3 to a post-convolution gain scalar (e.g. 0.0–2.0, unity at
+centre) applied to the FIR output before the peak limiter. This lets the user
+compensate for IRs that are perceptually quiet after normalisation (e.g. large
+diffuse spaces with low peak but high RMS).
