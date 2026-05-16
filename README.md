@@ -93,6 +93,29 @@ Longer files are accepted but truncated to 1024 samples at load time.
 | DTCMRAM    | FIR convolution state buffers ~8.4 KB (6.6% of 128 KB) |
 | SRAM       | Comb delay line ~75 KB + globals ≈ 26% of 512 KB |
 
+## Dependencies
+
+This project requires **libDaisy** and **DaisySP** to live as sibling directories alongside `daisy-patch-sampler/` — one level up, not inside this repo.
+
+```
+daisy_patch/                ← shared parent directory
+├── libDaisy/               ← clone here
+├── DaisySP/                ← clone here
+└── daisy-patch-sampler/    ← this repo
+    └── daisy_patch_sampler/
+```
+
+**One-time setup (run from the shared parent directory):**
+
+```bash
+git clone https://github.com/electro-smith/libDaisy.git
+git clone https://github.com/electro-smith/DaisySP.git
+cd libDaisy && git submodule update --init --recursive && make && cd ..
+cd DaisySP && make && cd ..
+```
+
+You only need to do this once — all Daisy projects in the same parent directory share these builds.
+
 ## Build & flash
 
 The firmware runs from external QSPI flash via the Daisy bootloader. Flashing uses USB DFU — not the SWD debug probe.
@@ -133,8 +156,6 @@ make program-dfu
 Then connect the SWD probe and launch **Cortex Debug** in VSCode. It will attach to the running app using hardware breakpoints.
 
 > **Note:** Breakpoints inside `main()` itself will not be hit — the bootloader jumps to the app before the debugger attaches. Breakpoints in functions called from the main loop (`UpdateControls`, `UpdateDisplay`, `AudioCallback`, etc.) work normally once attached.
-
-Dependencies (git submodules): `libDaisy`, `DaisySP`
 
 ## Hardware
 

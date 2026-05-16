@@ -11,14 +11,14 @@ C_SOURCES  += ffascii.c
 # breaks the serial VMLA dependency chain. Without it, M7's 5-cycle VMLA latency
 # serialises each MAC, costing ~6 cycles/tap instead of ~1 cycle/tap, and the
 # 1024-tap × 2-channel FIR overruns the audio budget (~590K vs 480K cycles).
-CMSIS_DSP_SRC = ../libDaisy/Drivers/CMSIS-DSP/Source/FilteringFunctions
+CMSIS_DSP_SRC = ../../libDaisy/Drivers/CMSIS-DSP/Source/FilteringFunctions
 C_SOURCES     += $(CMSIS_DSP_SRC)/arm_fir_f32.c
 C_SOURCES     += $(CMSIS_DSP_SRC)/arm_fir_init_f32.c
-C_INCLUDES    += -I../libDaisy/Drivers/CMSIS-DSP/PrivateInclude
+C_INCLUDES    += -I../../libDaisy/Drivers/CMSIS-DSP/PrivateInclude
 C_DEFS        += -DARM_MATH_LOOPUNROLL
 
-LIBDAISY_DIR = ../libDaisy
-DAISYSP_DIR  = ../DaisySP
+LIBDAISY_DIR = ../../libDaisy
+DAISYSP_DIR  = ../../DaisySP
 
 # Run from external QSPI flash (XIP). Requires Daisy bootloader.
 # Flash with: make program-dfu  (NOT make program — OpenOCD can't target QSPI)
